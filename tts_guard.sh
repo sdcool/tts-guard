@@ -14,10 +14,19 @@
 #      单句异常重试 1 次仍失败则报错退出），句间插入 0.4 秒静音拼接；
 #   4) 输出最终 mp3 并校验总时长合理。
 # 环境变量 FORCE_SPLIT=1 可强制走分段路径（用于测试）。
+# 环境变量 TTS_PROVIDER: cli（默认，走 TTS_BIN 指向的 CLI）
+#                         edge（走 edge-tts，需 pip install edge-tts；
+#                               EDGE_VOICE 可指定音色，默认 zh-CN-XiaoxiaoNeural）
 # 退出码: 0 成功；非 0 失败并输出原因。
 
 set -u
 TTS="${TTS_BIN:-tts}"  # 指向你的 TTS CLI；合成函数 synth() 的参数风格需按你的引擎适配，守卫逻辑与引擎无关
+PROVIDER="${TTS_PROVIDER:-cli}"
+case "$PROVIDER" in
+  cli|edge) ;;
+  *) echo "ERR: 未知 TTS_PROVIDER: $PROVIDER（可选 cli / edge）" >&2; exit 2;;
+esac
+EDGE_TTS="${EDGE_TTS_BIN:-edge-tts}"
 OUT="$1"; TXT="$2"; shift 2
 
 VOICE="avocado_v2:MAI_03"   # 与手册步骤2一致：不指定 voice 即默认 MAI_03
@@ -33,6 +42,9 @@ done
 
 [ -f "$TXT" ] || { echo "ERR: 文案文件不存在: $TXT" >&2; exit 2; }
 command -v ffprobe >/dev/null || { echo "ERR: 缺少 ffprobe" >&2; exit 2; }
+if [ "$PROVIDER" = "edge" ]; then
+  command -v "$EDGE_TTS" >/dev/null || { echo "ERR: 未找到 edge-tts，请先 pip install edge-tts" >&2; exit 2; }
+fi
 
 TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
 
@@ -41,9 +53,23 @@ chars() { LC_ALL=C.utf8 tr -d '[:space:]' < "$1" | LC_ALL=C.utf8 wc -m | tr -d '
 # 音频时长（秒，失败返回空）
 dur() { ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null | head -1; }
 
+# edge-tts 音色: EDGE_VOICE 优先；其次用 --voice 传入的非默认音色；否则默认晓晓
+edge_voice() {
+  if [ -n "${EDGE_VOICE:-}" ]; then echo "$EDGE_VOICE";
+  elif [ "$VOICE" != "avocado_v2:MAI_03" ]; then echo "$VOICE";
+  else echo "zh-CN-XiaoxiaoNeural"; fi
+}
+# edge-tts 语速: speed 100 → +0%，N → (N-100)%
+edge_rate() { awk -v s="$1" 'BEGIN{d=s-100; if (d>=0) printf "+%d%%", d; else printf "%d%%", d}'; }
+
 synth() { # $1=输出, $2=文案文件, $3=speed
-  "$TTS" speak --voice "$VOICE" --language zh --speed "$3" \
-    --output "$1" --text-stdin "${EXTRA[@]}" < "$2" >/dev/null 2>"$TMPD/tts.err"
+  if [ "$PROVIDER" = "edge" ]; then
+    "$EDGE_TTS" --file "$2" --voice "$(edge_voice)" --rate="$(edge_rate "$3")" \
+      --write-media "$1" >/dev/null 2>"$TMPD/tts.err"
+  else
+    "$TTS" speak --voice "$VOICE" --language zh --speed "$3" \
+      --output "$1" --text-stdin "${EXTRA[@]}" < "$2" >/dev/null 2>"$TMPD/tts.err"
+  fi
 }
 
 abnormal() { # $1=音频文件, $2=字数 → 回显 0 正常 / 1 异常
